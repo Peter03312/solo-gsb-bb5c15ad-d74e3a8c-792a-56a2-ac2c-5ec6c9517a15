@@ -200,6 +200,32 @@ button.danger { background: transparent; border: 1px solid var(--danger); color:
 .rev-item .state.ok { color: var(--ok); }
 .rev-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 
+/* 逐词校时预览 */
+.wc-h3 { font-size: 13px; margin: 14px 0 6px; color: var(--text); }
+.wc-h3:first-child { margin-top: 0; }
+.wc-grid { display: flex; flex-direction: column; gap: 4px; }
+.wc-row {
+  display: grid;
+  grid-template-columns: 56px 120px 1fr 1.6fr;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 4px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  word-break: break-all;
+}
+.wc-row.wc-head {
+  background: transparent; border: none; color: var(--muted);
+  font-size: 11px; padding: 2px 8px;
+}
+.wc-row.changed { border-color: var(--accent); }
+.wc-row.locked-cue { border-color: var(--ok); }
+.wc-row .muted { color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+.wc-row .accent { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
+.rev-item.locked-cue { border-color: var(--ok); }
+
 
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }

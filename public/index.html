@@ -80,6 +80,18 @@
           <button id="btn-rev-submit" class="primary">提交提议</button>
         </div>
       </section>
+
+      <section class="panel">
+        <h2>⑥ 逐词校时（词时间修正）</h2>
+        <p class="hint">按<strong>词序号</strong>提交一组起止毫秒修正（词序、词文本不变）。
+        格式：<code>{"sub_version":0,"corrections":[{"idx":3,"start_ms":1500,"end_ms":1900}]}</code>。
+        序号不得重复，时间须为非负整数且开始早于结束；锁定行原样保留，只重排受影响的未锁定区间。</p>
+        <textarea id="wc-json" rows="6" spellcheck="false" placeholder='{"sub_version":0,"corrections":[{"idx":0,"start_ms":0,"end_ms":450}]}'></textarea>
+        <div class="row buttons">
+          <button id="btn-wc-fill" class="secondary">填入所有词</button>
+          <button id="btn-wc-preview" class="primary">预览受影响字幕与冲突</button>
+        </div>
+      </section>
     </aside>
 
     <section class="content">
@@ -96,6 +108,11 @@
       <div id="rev-detail-panel" class="panel hidden">
         <h2 id="rev-detail-title"></h2>
         <div id="rev-detail-body"></div>
+      </div>
+
+      <div id="wc-detail-panel" class="panel hidden">
+        <h2>逐词校时 · 预览核对</h2>
+        <div id="wc-detail-body"></div>
       </div>
 
       <div class="panel">

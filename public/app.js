@@ -78,6 +78,7 @@ function renderAll() {
   renderExports();
   renderRevisions();
   $('#force-row').classList.add('hidden');
+  $('#wc-detail-panel').classList.add('hidden');
 }
 
 function renderRules() {
@@ -398,6 +399,195 @@ function fillRevisionTemplate() {
   toast('已填入全部未锁定行（按需删除/修改；时间字段可整段省略）');
 }
 
+// ---------- 逐词校时（词时间修正） ----------
+
+function fillWordCorrectionTemplate() {
+  const p = state.project;
+  if (!p) return toast('请先选择项目', true);
+  const payload = {
+    sub_version: p.sub_version,
+    corrections: p.words.map((w, idx) => ({ idx, start_ms: w.start_ms, end_ms: w.end_ms })),
+  };
+  $('#wc-json').value = JSON.stringify(payload, null, 2);
+  toast('已填入全部词的当前时间与字幕集版本，请按需删改（只保留需要修正的词）');
+}
+
+function wcLine(label, value, cls) {
+  return `<div class="rev-line${cls ? ` ${cls}` : ''}"><span class="k">${label}</span><span class="v">${value}</span></div>`;
+}
+
+function renderWordCorrection(ev, subVersion) {
+  const panel = $('#wc-detail-panel');
+  const box = $('#wc-detail-body');
+  box.innerHTML = '';
+
+  // 1. 词修正明细
+  const wordsTitle = document.createElement('h3');
+  wordsTitle.className = 'wc-h3';
+  wordsTitle.textContent = `词时间修正（${ev.corrections.length} 项，基于字幕集 v${subVersion}）`;
+  box.appendChild(wordsTitle);
+  const wList = document.createElement('div');
+  wList.className = 'wc-grid';
+  const wHead = document.createElement('div');
+  wHead.className = 'wc-row wc-head';
+  wHead.innerHTML = '<span>#</span><span>词</span><span>原 [起, 止]</span><span>→ 新 [起, 止]</span>';
+  wList.appendChild(wHead);
+  for (const c of ev.corrections) {
+    const row = document.createElement('div');
+    row.className = 'wc-row' + (c.changed ? ' changed' : '');
+    row.innerHTML =
+      `<span>${c.idx}</span><span>${escapeHtml(c.text)}</span>` +
+      `<span class="muted">[${c.orig.start_ms}, ${c.orig.end_ms}]</span>` +
+      `<span class="accent">[${c.start_ms}, ${c.end_ms}]</span>`;
+    wList.appendChild(row);
+  }
+  box.appendChild(wList);
+
+  // 2. 受影响字幕
+  if (ev.affected_cues && ev.affected_cues.length > 0) {
+    const h = document.createElement('h3');
+    h.className = 'wc-h3';
+    h.textContent = `受影响字幕（${ev.affected_cues.length} 条）`;
+    box.appendChild(h);
+    const list = document.createElement('div');
+    list.className = 'rev-items';
+    for (const cue of ev.affected_cues) {
+      const div = document.createElement('div');
+      div.className = 'rev-item' + (cue.action === 'retain_locked' ? ' locked-cue' : '');
+      const actionText = cue.action === 'retain_locked'
+        ? '🔒 锁定：文本与时间原样保留（仅更新词时间）'
+        : '未锁定：整段删除后以新行重排（新 ID，旧版本失效）';
+      div.innerHTML =
+        `<div class="rev-line"><span class="k">字幕 #${cue.idx + 1}</span>` +
+        `<span class="v">ID ${cue.id} · v${cue.version} · 词 ${cue.word_start}–${cue.word_end}` +
+        ` · <span class="state ${cue.action === 'retain_locked' ? 'ok' : ''}">${actionText}</span></span></div>` +
+        wcLine('内容', `"${escapeHtml(cue.text)}" [${cue.start_ms}, ${cue.end_ms}]`);
+      list.appendChild(div);
+    }
+    box.appendChild(list);
+  }
+
+  // 3. 候选整版（应用后）
+  if (ev.candidate_cues && ev.candidate_cues.length > 0) {
+    const h = document.createElement('h3');
+    h.className = 'wc-h3';
+    h.textContent = '确认后候选字幕（按时间升序）';
+    box.appendChild(h);
+    const grid = document.createElement('div');
+    grid.className = 'wc-grid';
+    const head = document.createElement('div');
+    head.className = 'wc-row wc-head';
+    head.innerHTML = '<span>序</span><span>词</span><span>时段</span><span>文本 / 来源</span>';
+    grid.appendChild(head);
+    for (const cue of ev.candidate_cues) {
+      const row = document.createElement('div');
+      row.className = 'wc-row' +
+        (cue.action === 'new' ? ' changed' : cue.action === 'retain_locked' ? ' locked-cue' : '');
+      const src = cue.action === 'new'
+        ? '✨ 重排新行'
+        : cue.action === 'retain_locked' ? '🔒 锁定原样' : '保留原行';
+      row.innerHTML =
+        `<span>${cue.idx + 1}</span><span>${cue.word_start}–${cue.word_end}</span>` +
+        `<span>[${cue.start_ms}, ${cue.end_ms}]</span>` +
+        `<span>${escapeHtml(cue.text)} <span class="muted">（${src}${cue.id ? ' · ID ' + cue.id : ''}）</span></span>`;
+      grid.appendChild(row);
+    }
+    box.appendChild(grid);
+  }
+
+  // 4. 冲突
+  if (ev.conflicts.length > 0) {
+    const ul = document.createElement('ul');
+    ul.className = 'rev-reasons';
+    for (const c of ev.conflicts) {
+      const li = document.createElement('li');
+      const idx = (c.corrected_indices || []).length
+        ? `词 ${(c.corrected_indices || []).join(', ')}：`
+        : `词 ${c.word_start}${c.word_end !== c.word_start ? '–' + c.word_end : ''}：`;
+      li.textContent = `• [${c.type}] ${idx}${c.message}`;
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+
+  // 5. 操作行
+  const actions = document.createElement('div');
+  actions.className = 'rev-actions';
+  const verdict = document.createElement('span');
+  verdict.className = 'hint';
+  verdict.style.flex = '1';
+  verdict.textContent = ev.ok
+    ? '✓ 全部约束满足：词按序不重叠、锁定行兼容、词完整覆盖/切点隔离/字数·时长·字速均通过，可确认（原子写入）'
+    : `✗ ${ev.conflicts.length} 处冲突，确认将被整组拒绝，词与字幕均不变`;
+  verdict.style.color = ev.ok ? 'var(--ok)' : 'var(--danger)';
+  const confirmBtn = document.createElement('button');
+  confirmBtn.textContent = '确认修正（原子更新）';
+  confirmBtn.disabled = !ev.ok;
+  confirmBtn.style.opacity = ev.ok ? 1 : 0.5;
+  confirmBtn.onclick = () => confirmWordCorrections(subVersion);
+  actions.append(verdict, confirmBtn);
+  box.appendChild(actions);
+
+  panel.classList.remove('hidden');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function previewWordCorrections() {
+  const p = state.project;
+  if (!p) return toast('请先选择项目', true);
+  let payload;
+  try {
+    payload = JSON.parse($('#wc-json').value || '{}');
+  } catch (e) {
+    return toast('JSON 解析失败：' + e.message, true);
+  }
+  const { status, body } = await api(`/api/projects/${p.id}/word-corrections/preview`, {
+    method: 'POST', body: JSON.stringify(payload),
+  });
+  if (status === 200) {
+    renderWordCorrection(body.evaluation, body.sub_version);
+  } else if (status === 400) {
+    toast('请求非法：' + (body.errors || []).join('；'), true);
+  } else if (status === 409) {
+    toast(body.error, true);
+    await loadProject(p.id);
+  } else {
+    toast(body?.error || '预览失败', true);
+  }
+}
+
+async function confirmWordCorrections(subVersion) {
+  const p = state.project;
+  let payload;
+  try {
+    payload = JSON.parse($('#wc-json').value || '{}');
+  } catch (e) {
+    return toast('JSON 解析失败：' + e.message, true);
+  }
+  // 以服务端预览时的权威版本为准，避免面板停留期间本地状态漂移
+  payload.sub_version = subVersion;
+  const { status, body } = await api(`/api/projects/${p.id}/word-corrections/confirm`, {
+    method: 'POST', body: JSON.stringify(payload),
+  });
+  if (status === 200) {
+    toast(`✓ 已原子确认：更新 ${payload.corrections.length} 个词时间，重排 ${body.deleted_cue_ids.length} 条受影响字幕（字幕集 v${body.sub_version}）；既有导出快照不变`);
+    $('#wc-detail-panel').classList.add('hidden');
+    $('#wc-json').value = '';
+    await loadProject(p.id);
+  } else if (status === 409) {
+    toast(body.error, true);
+    $('#wc-detail-panel').classList.add('hidden');
+    await loadProject(p.id);
+  } else if (status === 422) {
+    toast((body.error || '确认失败') +
+      ((body.conflicts || []).length ? '：' + body.conflicts.map((c) => c.message).slice(0, 2).join('｜') : ''), true);
+  } else if (status === 400) {
+    toast('请求非法：' + (body.errors || []).join('；'), true);
+  } else {
+    toast(body?.error || '确认失败', true);
+  }
+}
+
 function renderConflicts(conflicts, title) {
   const panel = $('#conflict-panel');
   const ul = $('#conflict-list');
@@ -633,5 +823,7 @@ $('#btn-sample-conflict').addEventListener('click', () => {
 });
 $('#btn-rev-submit').addEventListener('click', submitRevision);
 $('#btn-rev-fill').addEventListener('click', fillRevisionTemplate);
+$('#btn-wc-preview').addEventListener('click', previewWordCorrections);
+$('#btn-wc-fill').addEventListener('click', fillWordCorrectionTemplate);
 
 loadProjects();

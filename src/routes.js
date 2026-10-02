@@ -5,6 +5,7 @@ const { loadProject, listRevisions, loadRevision, bumpSubVersion, DEFAULT_RULES 
 const { computeLayout, validateStructure, validateRules } = require('./layout');
 const { validateWords, validateCuts, validateRules: validateRulesInput, validateSubtitleEdit } = require('./validate');
 const { parseRevisionItems, evaluateRevision } = require('./revision');
+const { parseWordCorrections, evaluateWordCorrections } = require('./word-correction');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -543,6 +544,175 @@ function createApp(db) {
       if (err instanceof AcceptReject) {
         return res.status(err.statusCode).json(err.payload);
       }
+      throw err;
+    }
+  });
+
+  // ---------- 逐词校时（词时间修正：预览 → 确认） ----------
+  //
+  // 校对者按词序号提交一组起止毫秒修正，携带读取时字幕集版本：
+  //   预览只读：并列受影响字幕与冲突，词与字幕均不变；
+  //   确认在同一事务内重新读取权威状态再次评估，通过后原子更新
+  //   词时间 + 字幕（受影响未锁定区间删除后以新 ID 重排；未受影响行保留 ID/版本/人工文本；
+  //   锁定行原样）并推进 sub_version。任一冲突或版本过期则整体不生效。
+
+  /** 词序号越界等与当前转写相关的形状校验，返回错误字符串数组（空数组通过） */
+  function checkCorrectionRanges(project, corrections) {
+    const errors = [];
+    for (const c of corrections) {
+      if (c.idx >= project.words.length) {
+        errors.push(`词序号 ${c.idx} 超出转写范围（当前共 ${project.words.length} 词，序号 0..${project.words.length - 1}）`);
+      }
+    }
+    return errors;
+  }
+
+  /** 只读预览：并列受影响字幕与冲突，不改动词与字幕 */
+  app.post('/api/projects/:id/word-corrections/preview', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseWordCorrections(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: '词修正请求非法', errors: parsed.errors });
+
+    // idx 越界属于请求本身的形状问题，优先于版本过期检查
+    const rangeErrors = checkCorrectionRanges(p, parsed.corrections);
+    if (rangeErrors.length > 0) {
+      return res.status(400).json({ error: '词修正请求非法', errors: rangeErrors });
+    }
+    if (p.subtitles.length === 0) {
+      return res.status(422).json({
+        error: '尚无字幕：请先排版后再逐词校时',
+        conflicts: [],
+      });
+    }
+
+    if (parsed.sub_version !== p.sub_version) {
+      return res.status(409).json({
+        error: `字幕集已被修改（你读取时为 v${parsed.sub_version}，当前已是 v${p.sub_version}），请刷新后重新预览`,
+        current: { sub_version: p.sub_version, subtitles: p.subtitles, words: p.words },
+      });
+    }
+
+    const evaluation = evaluateWordCorrections({ project: p, corrections: parsed.corrections });
+    res.json({
+      sub_version: p.sub_version,
+      rules_version: p.rules.version,
+      evaluation,
+    });
+  });
+
+  /** 确认：事务内再次评估并原子写入词时间与受影响字幕，推进字幕集版本 */
+  app.post('/api/projects/:id/word-corrections/confirm', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseWordCorrections(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: '词修正请求非法', errors: parsed.errors });
+
+    class ConfirmReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '确认被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      // 事务内读取权威当前状态，防止预览后被并发修改
+      const fresh = loadProject(db, p.id);
+
+      if (parsed.sub_version !== fresh.sub_version) {
+        throw new ConfirmReject(409, {
+          error: `字幕集版本过期：你基于 v${parsed.sub_version} 确认，当前已是 v${fresh.sub_version}，词与字幕均未改动`,
+          current: { sub_version: fresh.sub_version, subtitles: fresh.subtitles, words: fresh.words },
+        });
+      }
+      const rangeErrors = checkCorrectionRanges(fresh, parsed.corrections);
+      if (rangeErrors.length > 0) throw new ConfirmReject(400, { error: '词修正请求非法', errors: rangeErrors });
+
+      if (fresh.subtitles.length === 0) {
+        throw new ConfirmReject(422, {
+          error: '尚无字幕：请先排版后再逐词校时',
+          conflicts: [],
+          current: { sub_version: fresh.sub_version, subtitles: fresh.subtitles },
+        });
+      }
+
+      const evaluation = evaluateWordCorrections({ project: fresh, corrections: parsed.corrections });
+      if (!evaluation.ok) {
+        throw new ConfirmReject(422, {
+          error:
+            `词修正无法兼顾锁定/排版约束（${evaluation.conflicts.length} 处冲突），词与字幕均未改动；` +
+            `冲突已定位到词/字幕`,
+          conflicts: evaluation.conflicts,
+          affected_cues: evaluation.affected_cues,
+          current: { sub_version: fresh.sub_version, subtitles: fresh.subtitles },
+        });
+      }
+
+      // 全部通过：原子更新词时间
+      const updWord = db.prepare(
+        'UPDATE words SET start_ms = ?, end_ms = ? WHERE project_id = ? AND idx = ?'
+      );
+      for (const c of parsed.corrections) {
+        const info = updWord.run(c.start_ms, c.end_ms, fresh.id, c.idx);
+        if (info.changes !== 1) {
+          throw new ConfirmReject(409, {
+            error: `词 ${c.idx} 在确认瞬间发生变化，请刷新后重试`,
+            current: { sub_version: fresh.sub_version },
+          });
+        }
+      }
+
+      // 受影响的未锁定字幕整段删除（引用这些行 ID 的旧修订提议再采纳时会命中 missing，不会误采纳），
+      // 未受影响行保留 ID/版本/人工文本，仅按新顺序更新 idx；重排产生的行以新 ID 插入
+      const relayoutIds = new Set(
+        evaluation.affected_cues.filter((c) => c.action === 'relayout').map((c) => c.id)
+      );
+      if (relayoutIds.size > 0) {
+        const del = db.prepare('DELETE FROM subtitles WHERE project_id = ? AND id = ? AND locked = 0');
+        for (const id of relayoutIds) del.run(fresh.id, id);
+      }
+      const updIdx = db.prepare('UPDATE subtitles SET idx = ? WHERE id = ? AND project_id = ?');
+      const insCue = db.prepare(
+        `INSERT INTO subtitles (project_id, idx, word_start, word_end, text, start_ms, end_ms, locked)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
+      );
+      for (const cue of evaluation.candidate_cues) {
+        if (cue.action === 'new') {
+          insCue.run(fresh.id, cue.idx, cue.word_start, cue.word_end, cue.text, cue.start_ms, cue.end_ms);
+        } else {
+          updIdx.run(cue.idx, cue.id, fresh.id);
+        }
+      }
+
+      // 写入后整版自检（结构 + 当前规则，含锁定行），失败即回滚
+      const updated = loadProject(db, fresh.id);
+      const finalProblems = [
+        ...validateStructure(updated.subtitles, updated.words, updated.cuts),
+        ...validateRules(updated.subtitles, updated.rules),
+      ];
+      if (finalProblems.length > 0) {
+        throw new ConfirmReject(422, {
+          error: `确认后整版校验发现 ${finalProblems.length} 处问题，词与字幕均已回滚`,
+          conflicts: finalProblems,
+        });
+      }
+
+      const subVersion = bumpSubVersion(db, fresh.id);
+      return { subVersion, updated, relayoutIds: [...relayoutIds] };
+    });
+
+    try {
+      const { subVersion, updated, relayoutIds } = tx();
+      res.json({
+        ok: true,
+        sub_version: subVersion,
+        words: updated.words,
+        subtitles: updated.subtitles,
+        deleted_cue_ids: relayoutIds,
+      });
+    } catch (err) {
+      if (err instanceof ConfirmReject) return res.status(err.statusCode).json(err.payload);
       throw err;
     }
   });
