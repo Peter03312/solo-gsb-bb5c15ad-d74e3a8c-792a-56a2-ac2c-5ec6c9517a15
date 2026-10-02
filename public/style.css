@@ -200,6 +200,16 @@ button.danger { background: transparent; border: 1px solid var(--danger); color:
 .rev-item .state.ok { color: var(--ok); }
 .rev-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 
+/* 逐词修正候选整版 */
+.wr-candidate { margin: 12px 0; }
+.wr-candidate .cue-row { grid-template-columns: 70px 90px 90px 1fr 150px 24px; opacity: .95; }
+.wr-candidate .cue-row.wr-cue-new { border-color: var(--accent); }
+.wr-candidate .cue-row.wr-cue-new .idx::after { content: ' ✨'; }
+.wr-candidate .cue-row.wr-cue-kept { border-style: dashed; }
+.wr-candidate input[readonly] { background: transparent; border-color: transparent; }
+.wr-candidate .meta { color: var(--ok); font-size: 11px; }
+.wr-candidate .wr-cue-new .meta { color: var(--accent); }
+
 
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }

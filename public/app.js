@@ -77,6 +77,7 @@ function renderAll() {
   renderSubtitles();
   renderExports();
   renderRevisions();
+  renderWordRevisions();
   $('#force-row').classList.add('hidden');
 }
 
@@ -398,6 +399,252 @@ function fillRevisionTemplate() {
   toast('已填入全部未锁定行（按需删除/修改；时间字段可整段省略）');
 }
 
+// ---------- 逐词时间修正提议 ----------
+
+function renderWordRevisions() {
+  const p = state.project;
+  const box = $('#wr-list');
+  box.innerHTML = '';
+  $('#wr-detail-panel').classList.add('hidden');
+  if (!p) return;
+  const list = p.word_revisions || [];
+  const pending = list.filter((r) => r.status === 'pending').length;
+  $('#wr-stats').textContent = `（共 ${list.length} 组，待确认 ${pending} 组）`;
+  if (list.length === 0) {
+    box.innerHTML = '<div class="empty">尚无逐词修正提议。校对发现词时间偏差时，可在左下角⑥按词序号提交。</div>';
+    return;
+  }
+  for (const r of list) {
+    const row = document.createElement('div');
+    row.className = 'rev-head' + (r.status === 'confirmed' ? ' accepted' : '');
+    const title = document.createElement('div');
+    title.className = 'rev-title';
+    const note = r.note ? ` · ${escapeHtml(r.note)}` : '';
+    title.innerHTML =
+      `词修正 #${r.id}${note}<div class="rev-note">` +
+      `${r.item_count} 词 · 基于字幕集 v${r.sub_version_snapshot} · ${r.created_at}` +
+      (r.confirmed_sub_version ? ` · 确认于字幕集 v${r.confirmed_sub_version}` : '') +
+      '</div>';
+    const tag = document.createElement('span');
+    tag.className = 'status-tag' + (r.status === 'confirmed' ? ' accepted' : '');
+    tag.textContent = r.status === 'confirmed' ? '✓ 已确认' : '待确认';
+    const btn = document.createElement('button');
+    btn.className = 'small secondary';
+    btn.textContent = '查看/预览';
+    btn.onclick = () => openWordRevision(r.id);
+    row.append(title, tag, btn);
+    box.appendChild(row);
+  }
+}
+
+function renderWrItem(it) {
+  const div = document.createElement('div');
+  const hasProblems = it.state !== 'ok' || it.conflicts.length > 0;
+  div.className = 'rev-item' + (hasProblems ? ' bad' : '');
+
+  const head = document.createElement('div');
+  head.className = 'rev-line';
+  const text = it.word_text ? ` "${escapeHtml(it.word_text)}"` : '';
+  head.innerHTML =
+    `<span class="k">第 ${it.ord + 1} 项</span>` +
+    `<span class="v">词 #${it.word_idx}${text}` +
+    `<span class="state ${it.state === 'ok' ? 'ok' : ''}">${
+      it.state === 'ok' ? '✓ 可应用' :
+      it.state === 'drifted' ? '⚠ 词时间已变动' : '✗ 词已不存在'
+    }</span></span>`;
+  div.appendChild(head);
+
+  div.appendChild(revLine('原值', `[${it.orig.start_ms}, ${it.orig.end_ms}]`));
+  if (it.current) {
+    const changed = it.current.start_ms !== it.orig.start_ms || it.current.end_ms !== it.orig.end_ms;
+    div.appendChild(revLine('当前值', `[${it.current.start_ms}, ${it.current.end_ms}]`, changed ? 'current' : ''));
+  }
+  div.appendChild(revLine('建议值', `[${it.proposed.start_ms}, ${it.proposed.end_ms}]`, 'proposed'));
+
+  if (it.conflicts.length > 0) {
+    const ul = document.createElement('ul');
+    ul.className = 'rev-reasons';
+    for (const c of it.conflicts) {
+      const li = document.createElement('li');
+      li.textContent = '• ' + c.message;
+      ul.appendChild(li);
+    }
+    div.appendChild(ul);
+  }
+  return div;
+}
+
+function renderWRCandidate(candidate) {
+  const wrap = document.createElement('div');
+  wrap.className = 'wr-candidate';
+  const title = document.createElement('p');
+  title.className = 'hint';
+  title.textContent = '候选整版预览（确认后生效）：';
+  wrap.appendChild(title);
+  const table = document.createElement('div');
+  table.className = 'cue-table';
+  for (const c of candidate) {
+    const row = document.createElement('div');
+    row.className = 'cue-row wr-cue-' + c.origin + (c.locked ? ' locked' : '');
+    row.innerHTML =
+      `<div class="idx">词${c.word_start}–${c.word_end}</div>` +
+      `<div>${c.start_ms}</div><div>${c.end_ms}</div>` +
+      `<input class="text-input" value="${escapeHtml(c.text)}" readonly>` +
+      `<div class="meta">${c.origin === 'kept'
+        ? `保留 #${c.id} v${c.version}${c.locked ? ' 🔒' : ''}`
+        : '重排新行（新 ID）'}</div><div></div>`;
+    table.appendChild(row);
+  }
+  wrap.appendChild(table);
+  return wrap;
+}
+
+async function openWordRevision(wrid) {
+  const p = state.project;
+  const { status, body } = await api(`/api/projects/${p.id}/word-revisions/${wrid}/preview`, { method: 'POST' });
+  if (status !== 200) return toast(body?.error || '预览失败', true);
+  const { revision, evaluation } = body;
+  const panel = $('#wr-detail-panel');
+  const box = $('#wr-detail-body');
+  box.innerHTML = '';
+  $('#wr-detail-title').textContent =
+    `词修正 #${revision.id}（${revision.status === 'confirmed' ? '✓ 已确认' : '待确认'}）${
+      revision.note ? '：' + escapeHtml(revision.note) : ''
+    }`;
+
+  if (evaluation.already_confirmed) {
+    const info = document.createElement('p');
+    info.className = 'hint';
+    info.textContent = `该修正已确认（字幕集推进到 v${revision.confirmed_sub_version}），重复提交不再改动词与字幕；以下为历史快照。`;
+    box.appendChild(info);
+  }
+
+  // 受影响字幕摘要
+  if (revision.status === 'pending') {
+    const sum = document.createElement('p');
+    sum.className = 'hint';
+    const rep = evaluation.replaced || [];
+    const lk = evaluation.affected_locked || [];
+    sum.innerHTML =
+      `将重排 <strong>${rep.length}</strong> 条受影响未锁定字幕` +
+      (rep.length ? `：${rep.map((s) => `#${s.id}`).join('、')}` : '') +
+      `；含修正词的锁定字幕 <strong>${lk.length}</strong> 条` +
+      (lk.length ? `：${lk.map((s) => `#${s.id}`).join('、')}（文本/时间原样保留）` : '') +
+      `；其余字幕保留 ID、行版本与人工文本。`;
+    box.appendChild(sum);
+  }
+
+  const itemsBox = document.createElement('div');
+  itemsBox.className = 'rev-items';
+  for (const it of evaluation.items) itemsBox.appendChild(renderWrItem(it));
+  box.appendChild(itemsBox);
+
+  if (evaluation.subtitles && evaluation.subtitles.length > 0) {
+    box.appendChild(renderWRCandidate(evaluation.subtitles));
+  }
+
+  const allReasons = [];
+  if (evaluation.conflicts && evaluation.conflicts.length > 0) {
+    const ul = document.createElement('ul');
+    ul.className = 'rev-reasons';
+    for (const c of evaluation.conflicts) {
+      const li = document.createElement('li');
+      const range = c.word_start !== undefined
+        ? `词 ${c.word_start}${c.word_end !== undefined && c.word_end !== c.word_start ? '–' + c.word_end : ''} `
+        : '';
+      li.textContent = `整版：${range}${c.message}`;
+      ul.appendChild(li);
+      allReasons.push(c.message);
+    }
+    box.appendChild(ul);
+  }
+
+  if (revision.status === 'pending') {
+    const actions = document.createElement('div');
+    actions.className = 'rev-actions';
+    const verdict = document.createElement('span');
+    verdict.className = 'hint';
+    verdict.style.flex = '1';
+    if (evaluation.stale) {
+      verdict.textContent = '✗ 字幕集版本已过期（提交后字幕集被修改），请刷新后重新修正';
+    } else {
+      verdict.textContent = evaluation.ok
+        ? '✓ 核对通过：确认后原子更新词时间、重排受影响区间并推进字幕集版本'
+        : '✗ 存在冲突或失效项，确认将被整组拒绝（词与字幕均不变）';
+    }
+    verdict.style.color = evaluation.ok ? 'var(--ok)' : 'var(--danger)';
+    const confirmBtn = document.createElement('button');
+    confirmBtn.textContent = '确认修正';
+    confirmBtn.disabled = !evaluation.ok;
+    confirmBtn.style.opacity = evaluation.ok ? 1 : 0.5;
+    confirmBtn.onclick = () => confirmWordRevision(wrid);
+    actions.append(verdict, confirmBtn);
+    box.appendChild(actions);
+  }
+  panel.classList.remove('hidden');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function submitWordRevision() {
+  const p = state.project;
+  if (!p) return toast('请先选择项目', true);
+  let parsed;
+  try {
+    parsed = JSON.parse($('#wr-json').value || '{}');
+  } catch (e) {
+    return toast('JSON 解析失败：' + e.message, true);
+  }
+  const payload = { note: $('#wr-note').value.trim(), ...parsed };
+  if (parsed.sub_version === undefined) payload.sub_version = p.sub_version;
+  const { status, body } = await api(`/api/projects/${p.id}/word-revisions`, {
+    method: 'POST', body: JSON.stringify(payload),
+  });
+  if (status === 201) {
+    toast(`词修正 #${body.id} 已保存（${body.items.length} 词），未改动正式词与字幕，请预览核对`);
+    await loadProject(p.id);
+    openWordRevision(body.id);
+  } else if (status === 400) {
+    toast('请求非法：' + (body.errors || []).join('；'), true);
+  } else if (status === 409) {
+    toast(body.error, true);
+    await loadProject(p.id);
+  } else if (status === 422) {
+    toast('词序列校验失败：' + (body.errors || []).join('；'), true);
+  } else {
+    toast(body?.error || '提交失败', true);
+  }
+}
+
+async function confirmWordRevision(wrid) {
+  const p = state.project;
+  const { status, body } = await api(`/api/projects/${p.id}/word-revisions/${wrid}/confirm`, { method: 'POST' });
+  if (status === 200) {
+    toast(`✓ 词修正 #${wrid} 已确认：更新 ${body.words_updated} 词，重排 ${body.cues_replaced} 条字幕（字幕集 v${body.sub_version}）`);
+    await loadProject(p.id);
+    openWordRevision(wrid);
+  } else if (status === 409 || status === 422) {
+    const itemReasons = (body.items || []).map((i) =>
+      `词${i.word_idx}: ${(i.reasons || []).map((r) => r.message).join('；')}`);
+    const groupReasons = (body.conflicts || []).map((c) => c.message);
+    toast((body.error || '确认失败') +
+      (itemReasons.length || groupReasons.length ? '：' + [...itemReasons, ...groupReasons].slice(0, 3).join('｜') : ''), true);
+    await loadProject(p.id);
+    openWordRevision(wrid);
+  } else {
+    toast(body?.error || '确认失败', true);
+  }
+}
+
+function fillWordRevisionTemplate() {
+  const p = state.project;
+  if (!p) return toast('请先选择项目', true);
+  const items = p.words.map((w) => ({
+    word_idx: w.idx, start_ms: w.start_ms, end_ms: w.end_ms,
+  }));
+  $('#wr-json').value = JSON.stringify({ sub_version: p.sub_version, items }, null, 2);
+  toast('已填入全部词的当前时间（按需删改；只保留要修正的词即可）');
+}
+
 function renderConflicts(conflicts, title) {
   const panel = $('#conflict-panel');
   const ul = $('#conflict-list');
@@ -633,5 +880,7 @@ $('#btn-sample-conflict').addEventListener('click', () => {
 });
 $('#btn-rev-submit').addEventListener('click', submitRevision);
 $('#btn-rev-fill').addEventListener('click', fillRevisionTemplate);
+$('#btn-wr-submit').addEventListener('click', submitWordRevision);
+$('#btn-wr-fill').addEventListener('click', fillWordRevisionTemplate);
 
 loadProjects();

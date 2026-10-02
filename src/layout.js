@@ -256,11 +256,12 @@ function computeLayout({ words, cuts, rules, locked }) {
 
   if (conflicts.length > 0) return { ok: false, conflicts };
 
-  // 5. 合并锁定字幕，按时间升序
+  // 5. 合并固定字幕，按时间升序（入参固定行一般为锁定行；逐词修正重排时也会
+  //    传入未受影响的未锁定行——此时显式携带 locked: 0）
   const cues = [
     ...lockedSorted.map((L) => ({
       word_start: L.word_start, word_end: L.word_end, text: L.text,
-      start_ms: L.start_ms, end_ms: L.end_ms, locked: 1,
+      start_ms: L.start_ms, end_ms: L.end_ms, locked: L.locked === 0 ? 0 : 1,
     })),
     ...newCues,
   ].sort((x, y) => x.start_ms - y.start_ms || x.word_start - y.word_start);

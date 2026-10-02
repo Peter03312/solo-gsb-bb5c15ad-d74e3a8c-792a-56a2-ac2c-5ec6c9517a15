@@ -93,6 +93,30 @@ CREATE TABLE IF NOT EXISTS revision_items (
   end_ms        INTEGER,                        -- 可选：替代结束毫秒，NULL 表示沿用原值
   UNIQUE(revision_id, ord)
 );
+
+-- 校对者逐词时间修正提议：按词序号提交一组起止毫秒，确认后才更新 words 并重排受影响区间
+CREATE TABLE IF NOT EXISTS word_revisions (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id             INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  note                   TEXT NOT NULL DEFAULT '',    -- 校对说明
+  sub_version_snapshot   INTEGER NOT NULL,            -- 校对者读取字幕集时的 sub_version
+  status                 TEXT NOT NULL DEFAULT 'pending', -- pending（待确认）/ confirmed（已确认）
+  confirmed_at           TEXT,
+  confirmed_sub_version  INTEGER,                     -- 确认后字幕集推进到的版本
+  created_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS word_revision_items (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  word_revision_id INTEGER NOT NULL REFERENCES word_revisions(id) ON DELETE CASCADE,
+  ord             INTEGER NOT NULL,           -- 组内顺序
+  word_idx        INTEGER NOT NULL,           -- 词序号（words.idx，词序与词文本不可变）
+  orig_start_ms   INTEGER NOT NULL,           -- 读取时原开始毫秒快照
+  orig_end_ms     INTEGER NOT NULL,           -- 读取时原结束毫秒快照
+  start_ms        INTEGER NOT NULL,           -- 修正后开始毫秒
+  end_ms          INTEGER NOT NULL,           -- 修正后结束毫秒
+  UNIQUE(word_revision_id, ord)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
@@ -125,6 +149,7 @@ function loadProject(db, id) {
     'SELECT version, cue_count, created_at FROM exports WHERE project_id = ? ORDER BY version DESC'
   ).all(id);
   const revisions = listRevisions(db, id);
+  const wordRevisions = listWordRevisions(db, id);
   return {
     id: project.id,
     name: project.name,
@@ -139,6 +164,7 @@ function loadProject(db, id) {
     subtitles,
     exports: exportsList,
     revisions,
+    word_revisions: wordRevisions,
   };
 }
 
@@ -194,6 +220,54 @@ function bumpSubVersion(db, projectId) {
   return db.prepare('SELECT sub_version FROM projects WHERE id = ?').get(projectId).sub_version;
 }
 
+/** 项目下全部逐词修正提议摘要（不含逐项明细），按时间倒序 */
+function listWordRevisions(db, projectId) {
+  return db.prepare(
+    `SELECT r.id, r.note, r.status, r.sub_version_snapshot,
+            r.confirmed_sub_version, r.created_at, r.confirmed_at,
+            (SELECT COUNT(*) FROM word_revision_items i WHERE i.word_revision_id = r.id) AS item_count
+     FROM word_revisions r WHERE r.project_id = ? ORDER BY r.id DESC`
+  ).all(projectId);
+}
+
+/**
+ * 读取一个逐词修正提议（含逐项明细，并附带各词当前文本/时间，便于预览并列原值/当前值）。
+ * 不存在或不属于该项目返回 null。
+ */
+function loadWordRevision(db, projectId, revisionId) {
+  const head = db.prepare('SELECT * FROM word_revisions WHERE id = ? AND project_id = ?')
+    .get(revisionId, projectId);
+  if (!head) return null;
+  const items = db.prepare(
+    `SELECT i.ord, i.word_idx, i.orig_start_ms, i.orig_end_ms, i.start_ms, i.end_ms,
+            w.text AS word_text, w.start_ms AS cur_start_ms, w.end_ms AS cur_end_ms
+       FROM word_revision_items i
+       LEFT JOIN words w ON w.project_id = ? AND w.idx = i.word_idx
+      WHERE i.word_revision_id = ? ORDER BY i.ord`
+  ).all(projectId, revisionId);
+  return {
+    id: head.id,
+    project_id: head.project_id,
+    note: head.note,
+    status: head.status,
+    sub_version_snapshot: head.sub_version_snapshot,
+    confirmed_sub_version: head.confirmed_sub_version,
+    created_at: head.created_at,
+    confirmed_at: head.confirmed_at,
+    items: items.map((it) => ({
+      ord: it.ord,
+      word_idx: it.word_idx,
+      word_text: it.word_text ?? null,        // 重新导入后可能已不存在
+      orig: { start_ms: it.orig_start_ms, end_ms: it.orig_end_ms },
+      proposed: { start_ms: it.start_ms, end_ms: it.end_ms },
+      current: it.word_text === null
+        ? null
+        : { text: it.word_text, start_ms: it.cur_start_ms, end_ms: it.cur_end_ms },
+    })),
+  };
+}
+
 module.exports = {
-  initDb, loadProject, listRevisions, loadRevision, bumpSubVersion, DEFAULT_RULES,
+  initDb, loadProject, listRevisions, loadRevision,
+  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
 };

@@ -69,7 +69,7 @@
       </section>
 
       <section class="panel">
-        <h2>⑤ 批量修订提议（校对）</h2>
+        <h2>⑤ 批量修订提议（字幕）</h2>
         <p class="hint">针对<strong>未锁定</strong>字幕一次提交一组修订，不直接改正正式字幕；预览核对后再整组采纳。
         格式：<code>{"note":"说明","items":[{"subtitle_id":1,"cue_version":1,"text":"替代文本","start_ms":0,"end_ms":1000}]}</code>
         （时间可省略；空组、重复 ID、空文本、非法时间会被拒绝）</p>
@@ -79,6 +79,21 @@
           <button id="btn-rev-fill" class="secondary">填入所有行</button>
           <button id="btn-rev-submit" class="primary">提交提议</button>
         </div>
+      </section>
+
+      <section class="panel">
+        <h2>⑥ 逐词时间修正（词序/词文本不变）</h2>
+        <p class="hint">校对者发现逐词转写的时间偏差时，按<strong>词序号</strong>提交一组起止毫秒，携带读取时字幕集版本；
+        先预览<strong>受影响字幕与冲突</strong>，再确认。锁定字幕原样保留；仅受影响的未锁定区间重排，
+        未受影响字幕保留 ID/行版本/人工文本。
+        格式：<code>{"note":"说明","sub_version":1,"items":[{"word_idx":0,"start_ms":0,"end_ms":480}]}</code></p>
+        <input id="wr-note" type="text" placeholder="说明（可选）">
+        <textarea id="wr-json" rows="6" spellcheck="false" placeholder='{"sub_version":1,"items":[{"word_idx":0,"start_ms":0,"end_ms":480}]}'></textarea>
+        <div class="row buttons">
+          <button id="btn-wr-fill" class="secondary">填入所有词</button>
+          <button id="btn-wr-submit" class="primary">提交修正提议</button>
+        </div>
+        <p class="hint">提交只保存原值快照、不动正式词与字幕；预览通过后再<strong>确认</strong>（原子更新词时间+重排+推进版本）。</p>
       </section>
     </aside>
 
@@ -96,6 +111,16 @@
       <div id="rev-detail-panel" class="panel hidden">
         <h2 id="rev-detail-title"></h2>
         <div id="rev-detail-body"></div>
+      </div>
+
+      <div class="panel">
+        <h2>逐词修正提议历史 <span id="wr-stats" class="hint"></span></h2>
+        <div id="wr-list" class="rev-list"></div>
+      </div>
+
+      <div id="wr-detail-panel" class="panel hidden">
+        <h2 id="wr-detail-title"></h2>
+        <div id="wr-detail-body"></div>
       </div>
 
       <div class="panel">

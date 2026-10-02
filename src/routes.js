@@ -1,10 +1,14 @@
 'use strict';
 
 const express = require('express');
-const { loadProject, listRevisions, loadRevision, bumpSubVersion, DEFAULT_RULES } = require('./db');
+const {
+  loadProject, listRevisions, loadRevision,
+  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+} = require('./db');
 const { computeLayout, validateStructure, validateRules } = require('./layout');
 const { validateWords, validateCuts, validateRules: validateRulesInput, validateSubtitleEdit } = require('./validate');
 const { parseRevisionItems, evaluateRevision } = require('./revision');
+const { parseWordRevisionItems, evaluateWordRevision } = require('./word-revision');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -541,6 +545,287 @@ function createApp(db) {
       });
     } catch (err) {
       if (err instanceof AcceptReject) {
+        return res.status(err.statusCode).json(err.payload);
+      }
+      throw err;
+    }
+  });
+
+  // ---------- 校对者逐词时间修正提议（提交 → 预览 → 确认） ----------
+  //
+  // 按词序号提交一组起止毫秒修正，携带读取时字幕集 sub_version：
+  //   提交只保存原词时间快照，绝不动正式词/字幕；
+  //   预览只读核对：受影响字幕、锁定冲突、词序重叠与受影响区间重排候选；
+  //   确认时在同一事务里重新读取权威状态再次核对，通过后原子地
+  //   更新词时间、删除受影响未锁定字幕并重排、推进字幕集版本。
+  //   锁定字幕文本与时间原样保留；未受影响字幕保留 ID/行版本/人工文本。
+
+  function getWordRevision(req, res) {
+    const p = getProject(req, res);
+    if (!p) return null;
+    const wrid = Number(req.params.wrid);
+    const revision = loadWordRevision(db, p.id, wrid);
+    if (!revision) {
+      res.status(404).json({ error: `逐词修正提议 ${req.params.wrid} 不存在` });
+      return null;
+    }
+    return { p, revision };
+  }
+
+  /** 提交逐词修正提议（只保存快照，不动正式数据） */
+  app.post('/api/projects/:id/word-revisions', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const body = req.body || {};
+    if (body.sub_version === undefined || !Number.isInteger(body.sub_version) || body.sub_version < 0) {
+      return res.status(400).json({
+        error: '请求非法，未保存提议',
+        errors: ['sub_version（读取时字幕集版本）必须是 ≥0 的整数'],
+      });
+    }
+    // 1. 形状校验：空组 / 重复序号 / 非法时间 / 字段类型 → 400
+    const parsed = parseWordRevisionItems(body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '修正请求非法，未保存提议', errors: parsed.errors });
+    }
+
+    // 2. 字幕集乐观锁：携带的 sub_version 必须是当前值，过期直接返回当前值
+    if (body.sub_version !== p.sub_version) {
+      return res.status(409).json({
+        error: `字幕集已被修改（你基于 v${body.sub_version} 读取，当前已是 v${p.sub_version}），请刷新后重新修正`,
+        current: { sub_version: p.sub_version, words: p.words, subtitles: p.subtitles },
+      });
+    }
+
+    // 3. 状态校验：词序号须存在；修正后（与未修正词合并）全部词仍按序互不重叠。
+    //    锁定字幕是否容得下、重排是否可行等复杂核对留给预览/确认（保留提议供查看）。
+    const stateErrors = [];
+    const merged = p.words.map((w) => ({ ...w }));
+    for (const it of parsed.items) {
+      if (it.word_idx >= p.words.length) {
+        stateErrors.push(`词序号 ${it.word_idx} 超出范围（当前共 ${p.words.length} 个词，序号 0..${p.words.length - 1}）`);
+        continue;
+      }
+      merged[it.word_idx] = { ...merged[it.word_idx], start_ms: it.start_ms, end_ms: it.end_ms };
+    }
+    if (stateErrors.length === 0) {
+      for (let k = 0; k + 1 < merged.length; k++) {
+        if (merged[k + 1].start_ms < merged[k].end_ms) {
+          const touched = parsed.items.some((it) => it.word_idx === k || it.word_idx === k + 1);
+          if (touched) {
+            stateErrors.push(
+              `应用修正后词 ${k} "${merged[k].text}" [${merged[k].start_ms}, ${merged[k].end_ms}] 与 ` +
+              `词 ${k + 1} "${merged[k + 1].text}" [${merged[k + 1].start_ms}, ${merged[k + 1].end_ms}] ` +
+              '重叠或倒序：修正后全部词仍须按序且互不重叠'
+            );
+          }
+        }
+      }
+    }
+    if (stateErrors.length > 0) {
+      return res.status(422).json({ error: '修正请求未通过词序列校验，未保存提议', errors: stateErrors });
+    }
+
+    const note = body.note !== undefined ? String(body.note) : '';
+    const tx = db.transaction(() => {
+      const info = db.prepare(
+        'INSERT INTO word_revisions (project_id, note, sub_version_snapshot) VALUES (?, ?, ?)'
+      ).run(p.id, note, p.sub_version);
+      const wrid = info.lastInsertRowid;
+      const ins = db.prepare(
+        `INSERT INTO word_revision_items
+           (word_revision_id, ord, word_idx, orig_start_ms, orig_end_ms, start_ms, end_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      parsed.items.forEach((it, i) => {
+        const w = p.words[it.word_idx];
+        ins.run(wrid, i, it.word_idx, w.start_ms, w.end_ms, it.start_ms, it.end_ms);
+      });
+      return wrid;
+    });
+    const wrid = tx();
+    res.status(201).json(loadWordRevision(db, p.id, wrid));
+  });
+
+  /** 提议历史列表 */
+  app.get('/api/projects/:id/word-revisions', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json(listWordRevisions(db, p.id));
+  });
+
+  /** 单个提议（逐项原值/当前值/建议值） */
+  app.get('/api/projects/:id/word-revisions/:wrid', (req, res) => {
+    const got = getWordRevision(req, res);
+    if (got) res.json(got.revision);
+  });
+
+  /**
+   * 只读预览核对：受影响字幕（将被重排的未锁定行 / 含修正词的锁定行）、
+   * 逐项原词/当前词/建议词时间、候选整版与逐处中文冲突。
+   */
+  app.post('/api/projects/:id/word-revisions/:wrid/preview', (req, res) => {
+    const got = getWordRevision(req, res);
+    if (!got) return;
+    const { revision } = got;
+    if (revision.status === 'confirmed') {
+      return res.json({
+        revision,
+        evaluation: {
+          ok: false, stale: false, items: [], conflicts: [],
+          subtitles: [], replaced: [], affected_locked: [],
+          already_confirmed: true, confirmed_sub_version: revision.confirmed_sub_version,
+        },
+      });
+    }
+    const evaluation = evaluateWordRevision({ project: got.p, revision });
+    res.json({ revision, evaluation });
+  });
+
+  /**
+   * 确认：同一事务内重新读取权威状态并再次执行全部核对；
+   * 通过则原子写入词时间、删除受影响未锁定字幕并按候选重排（新 ID/新版本）、
+   * 更新保留行 idx（ID/行版本不变）、推进字幕集版本、标记提议已确认。
+   * 过期/失效（sub_version、词漂移、词缺失）→ 409；
+   * 锁定或排版规则不可兼顾 → 422；词与字幕均不变（事务回滚）。
+   */
+  app.post('/api/projects/:id/word-revisions/:wrid/confirm', (req, res) => {
+    const got = getWordRevision(req, res);
+    if (!got) return;
+    const { p, revision } = got;
+    if (revision.status === 'confirmed') {
+      return res.status(409).json({
+        error: `逐词修正提议 ${revision.id} 已确认（字幕集推进到 v${revision.confirmed_sub_version}），重复提交不得再改词与字幕`,
+        already_confirmed: true,
+        confirmed_sub_version: revision.confirmed_sub_version,
+        current: { sub_version: p.sub_version, words: p.words, subtitles: p.subtitles },
+      });
+    }
+
+    class ConfirmReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '确认被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      // 事务内读取权威当前状态（修订明细自身不变，freshRevision 取最新当前词时间）
+      const fresh = loadProject(db, p.id);
+      const freshRevision = loadWordRevision(db, fresh.id, revision.id);
+      const evaluation = evaluateWordRevision({ project: fresh, revision: freshRevision });
+
+      if (!evaluation.ok) {
+        const isStale =
+          evaluation.stale ||
+          evaluation.items.some((r) => r.state !== 'ok');
+        const items = evaluation.items
+          .filter((r) => r.state !== 'ok' || r.conflicts.length > 0)
+          .map((r) => ({
+            ord: r.ord, word_idx: r.word_idx, state: r.state,
+            orig: r.orig, current: r.current, proposed: r.proposed,
+            reasons: r.conflicts,
+          }));
+        throw new ConfirmReject(isStale ? 409 : 422, {
+          error: isStale
+            ? `逐词修正提议 ${revision.id} 基于过期字幕集/词时间，请刷新后重新修正（整组未生效）`
+            : `逐词修正提议 ${revision.id} 无法兼顾锁定或排版约束，共 ` +
+              `${items.length + evaluation.conflicts.length} 处问题；词与字幕均未改动`,
+          current: {
+            sub_version: fresh.sub_version,
+            words: fresh.words,
+            subtitles: fresh.subtitles,
+          },
+          items,
+          conflicts: evaluation.conflicts,
+          replaced: evaluation.replaced,
+          affected_locked: evaluation.affected_locked,
+        });
+      }
+
+      // 全部通过：1) 更新词时间（带原值 WHERE 兜底；词序/文本不动）
+      const updWord = db.prepare(
+        `UPDATE words SET start_ms = ?, end_ms = ?
+          WHERE project_id = ? AND idx = ? AND start_ms = ? AND end_ms = ?`
+      );
+      for (const it of freshRevision.items) {
+        const info = updWord.run(
+          it.proposed.start_ms, it.proposed.end_ms,
+          fresh.id, it.word_idx, it.orig.start_ms, it.orig.end_ms
+        );
+        if (info.changes !== 1) {
+          throw new ConfirmReject(409, {
+            error: `词 ${it.word_idx} 在确认瞬间发生变化，请刷新后重试`,
+            current: { sub_version: fresh.sub_version },
+          });
+        }
+      }
+
+      // 2) 删除受影响的未锁定字幕（带 locked=0 兜底；这些行随后以新 ID/新版本重排）
+      const replacedIds = evaluation.replaced.map((s) => s.id);
+      if (replacedIds.length > 0) {
+        const placeholders = replacedIds.map(() => '?').join(',');
+        const delInfo = db.prepare(
+          `DELETE FROM subtitles WHERE project_id = ? AND locked = 0 AND id IN (${placeholders})`
+        ).run(fresh.id, ...replacedIds);
+        if (delInfo.changes !== replacedIds.length) {
+          throw new ConfirmReject(409, {
+            error: '受影响字幕在确认瞬间发生变化（已锁定/已消失），请刷新后重试',
+            current: { sub_version: fresh.sub_version },
+          });
+        }
+      }
+
+      // 3) 按候选整版写入：新行 INSERT；保留行（含锁定行）仅更新 idx（ID/行版本不变）。
+      //    先把全部保留行 idx 挪到负的临时值（-id-1，必然互不相同），
+      //    避免 UNIQUE(project_id, idx) 在重排时与 0 起的正式 idx 临时撞号。
+      db.prepare('UPDATE subtitles SET idx = -id - 1 WHERE project_id = ?').run(fresh.id);
+      const insCue = db.prepare(
+        `INSERT INTO subtitles (project_id, idx, word_start, word_end, text, start_ms, end_ms, locked)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
+      );
+      const updIdx = db.prepare('UPDATE subtitles SET idx = ? WHERE id = ? AND project_id = ?');
+      evaluation.subtitles.forEach((c, i) => {
+        if (c.origin === 'kept') updIdx.run(i, c.id, fresh.id);
+        else insCue.run(fresh.id, i, c.word_start, c.word_end, c.text, c.start_ms, c.end_ms);
+      });
+
+      // 4) 写入后整版终检（结构 + 当前规则，含锁定行），失败即回滚
+      const updated = loadProject(db, fresh.id);
+      const finalProblems = [
+        ...validateStructure(updated.subtitles, updated.words, updated.cuts),
+        ...validateRules(updated.subtitles, updated.rules),
+      ];
+      if (finalProblems.length > 0) {
+        throw new ConfirmReject(422, {
+          error: `确认后整版校验发现 ${finalProblems.length} 处问题，词与字幕已全部回滚`,
+          conflicts: finalProblems,
+        });
+      }
+
+      const subVersion = bumpSubVersion(db, fresh.id);
+      db.prepare(
+        `UPDATE word_revisions SET status = 'confirmed', confirmed_at = datetime('now'),
+           confirmed_sub_version = ? WHERE id = ?`
+      ).run(subVersion, revision.id);
+      return { subVersion, replacedCount: replacedIds.length };
+    });
+
+    try {
+      const summary = tx();
+      const after = loadProject(db, p.id);
+      res.json({
+        word_revision_id: revision.id,
+        status: 'confirmed',
+        sub_version: summary.subVersion,
+        words_updated: revision.items.length,
+        cues_replaced: summary.replacedCount,
+        words: after.words,
+        subtitles: after.subtitles,
+      });
+    } catch (err) {
+      if (err instanceof ConfirmReject) {
         return res.status(err.statusCode).json(err.payload);
       }
       throw err;
